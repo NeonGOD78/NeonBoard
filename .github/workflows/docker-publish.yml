@@ -26,11 +26,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.CR_PAT }}
 
-
-
-      - name: Build and push image
+      - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
-          context: .
+          context: ./exporter
+          file: ./exporter/Dockerfile
           push: true
-          tags: ghcr.io/neongod78/tautulli-prometheus-exporter:latest
+          tags: ghcr.io/neongod78/neonboard-exporter:latest
