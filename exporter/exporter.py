@@ -1,3 +1,4 @@
+
 from flask import Flask, Response
 from prometheus_client import Gauge, generate_latest, CONTENT_TYPE_LATEST
 import psutil
@@ -40,12 +41,19 @@ top_ram = Gauge("neonboard_top_ram_process_mb", "Top process RAM usage in MB", [
 def get_qbit_download_path():
     try:
         session = requests.Session()
-        session.post(f"{QBIT_URL}/api/v2/auth/login", data={
+        login = session.post(f"{QBIT_URL}/api/v2/auth/login", data={
             "username": QBIT_USER,
             "password": QBIT_PASS
         }, timeout=5)
-        r = session.get(f"{QBIT_URL}/api/v2/app/preferences", timeout=5)
-        data = r.json()
+
+        if login.status_code != 200 or "ok" not in login.text:
+            raise Exception("Login failed")
+
+        pref = session.get(f"{QBIT_URL}/api/v2/app/preferences", timeout=5)
+        if pref.status_code != 200:
+            raise Exception("Could not fetch preferences")
+
+        data = pref.json()
         return data.get("save_path", "/mnt/local/downloads")
     except Exception as e:
         print(f"[WARNING] Failed to get qBittorrent download path: {e}")
@@ -53,7 +61,7 @@ def get_qbit_download_path():
 
 @app.route("/metrics")
 def metrics():
-    # ================== Tautulli ==================
+    # Tautulli
     try:
         r = requests.get(f"{TAUTULLI_URL}/api/v2?apikey={TAUTULLI_API_KEY}&cmd=get_activity", timeout=5)
         data = r.json()
@@ -65,7 +73,7 @@ def metrics():
     except Exception as e:
         print(f"[WARNING] Failed to fetch Tautulli metrics: {e}")
 
-    # ================== System ==================
+    # System
     try:
         gauges["neonboard_cpu_usage_percent"].set(psutil.cpu_percent(interval=1))
         gauges["neonboard_ram_usage_percent"].set(psutil.virtual_memory().percent)
