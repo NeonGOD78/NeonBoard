@@ -1,109 +1,101 @@
 from flask import Flask, Response
 from prometheus_client import Gauge, generate_latest, CONTENT_TYPE_LATEST
-import requests
-import os
 import psutil
 import shutil
 import platform
 import time
-import subprocess
+import os
+import requests
+import json
 
 app = Flask(__name__)
 
-# ========== Miljøvariabler ==========
+# Miljøvariabler
 TAUTULLI_API_KEY = os.getenv("TAUTULLI_API_KEY")
 TAUTULLI_URL = os.getenv("TAUTULLI_URL", "http://localhost:8181")
-QBIT_URL = os.getenv("QBIT_URL", "http://localhost:8080")
+EXPORTER_PORT = int(os.getenv("EXPORTER_PORT", "9814"))
+QBIT_URL = os.getenv("QBIT_URL")
 QBIT_USER = os.getenv("QBIT_USER")
 QBIT_PASS = os.getenv("QBIT_PASS")
-EXPORTER_PORT = int(os.getenv("EXPORTER_PORT", "9814"))
 
-# ========== Prometheus metrics ==========
-# Tautulli
-tautulli_active_streams = Gauge("tautulli_active_streams", "Number of active streams")
-tautulli_bandwidth_total = Gauge("tautulli_bandwidth_total_kbps", "Total bandwidth usage in kbps")
-tautulli_transcodes_active = Gauge("tautulli_transcodes_active", "Number of active transcodes")
+# Prometheus metrics
+gauges = {
+    "tautulli_active_streams": Gauge("tautulli_active_streams", "Number of active streams"),
+    "tautulli_bandwidth_total_kbps": Gauge("tautulli_bandwidth_total_kbps", "Total bandwidth usage in kbps"),
+    "tautulli_transcodes_active": Gauge("tautulli_transcodes_active", "Number of active transcodes"),
+    "neonboard_cpu_usage_percent": Gauge("neonboard_cpu_usage_percent", "Current CPU usage in percent"),
+    "neonboard_ram_usage_percent": Gauge("neonboard_ram_usage_percent", "Current RAM usage in percent"),
+    "neonboard_disk_root_bytes_free": Gauge("neonboard_disk_root_bytes_free", "Free disk space on / in bytes"),
+    "neonboard_disk_downloads_bytes_free": Gauge("neonboard_disk_downloads_bytes_free", "Free disk space on downloads mount in bytes"),
+    "neonboard_uptime_seconds": Gauge("neonboard_uptime_seconds", "System uptime in seconds"),
+    "neonboard_cpu_base_mhz": Gauge("neonboard_cpu_base_mhz", "CPU base clock speed in MHz"),
+    "neonboard_cpu_sockets": Gauge("neonboard_cpu_sockets", "Number of physical CPU sockets"),
+    "neonboard_cpu_cores": Gauge("neonboard_cpu_cores", "Number of physical CPU cores"),
+    "neonboard_cpu_threads": Gauge("neonboard_cpu_threads", "Number of logical CPU threads"),
+}
 
-# System
-cpu_usage = Gauge("neonboard_cpu_usage_percent", "Current CPU usage in percent")
-ram_usage = Gauge("neonboard_ram_usage_percent", "Current RAM usage in percent")
-disk_root_free = Gauge("neonboard_disk_root_bytes_free", "Free disk space on / in bytes")
-disk_downloads_free = Gauge("neonboard_disk_downloads_bytes_free", "Free disk space on downloads mount in bytes")
-uptime = Gauge("neonboard_uptime_seconds", "System uptime in seconds")
-cpu_base_clock = Gauge("neonboard_cpu_base_clock_ghz", "Base clock speed of CPU in GHz")
-cpu_cores = Gauge("neonboard_cpu_cores_total", "Total number of logical CPU cores")
-cpu_threads = Gauge("neonboard_cpu_threads_total", "Total number of threads (logical)")
-cpu_sockets = Gauge("neonboard_cpu_sockets_total", "Number of physical sockets")
+top_cpu = Gauge("neonboard_top_cpu_process_percent", "Top process CPU usage", ["name", "pid"])
+top_ram = Gauge("neonboard_top_ram_process_mb", "Top process RAM usage in MB", ["name", "pid"])
 
-# Top processes
-top_cpu_process = Gauge("neonboard_top_cpu_process_percent", "Top process by CPU usage", ["pid", "name"])
-top_ram_process = Gauge("neonboard_top_ram_process_bytes", "Top process by RAM usage", ["pid", "name"])
+def get_qbit_download_path():
+    try:
+        session = requests.Session()
+        session.post(f"{QBIT_URL}/api/v2/auth/login", data={
+            "username": QBIT_USER,
+            "password": QBIT_PASS
+        }, timeout=5)
+        r = session.get(f"{QBIT_URL}/api/v2/app/preferences", timeout=5)
+        data = r.json()
+        return data.get("save_path", "/mnt/local/downloads")
+    except Exception as e:
+        print(f"[WARNING] Failed to get qBittorrent download path: {e}")
+        return "/mnt/local/downloads"
 
 @app.route("/metrics")
 def metrics():
+    # ================== Tautulli ==================
     try:
-        # ===== Tautulli =====
-        tautulli_res = requests.get(
-            f"{TAUTULLI_URL}/api/v2?apikey={TAUTULLI_API_KEY}&cmd=get_activity",
-            timeout=5
-        )
-        tautulli_data = tautulli_res.json()
-        sessions = tautulli_data.get("response", {}).get("data", {}).get("sessions", [])
+        r = requests.get(f"{TAUTULLI_URL}/api/v2?apikey={TAUTULLI_API_KEY}&cmd=get_activity", timeout=5)
+        data = r.json()
+        sessions = data.get("response", {}).get("data", {}).get("sessions", [])
 
-        tautulli_active_streams.set(len(sessions))
-        total_bandwidth = sum(int(s.get("wan_bandwidth", 0)) for s in sessions)
-        tautulli_bandwidth_total.set(total_bandwidth)
-        tautulli_transcodes_active.set(sum(1 for s in sessions if s.get("transcode_decision") == "transcode"))
-
-        # ===== System metrics =====
-        cpu_usage.set(psutil.cpu_percent())
-        ram_usage.set(psutil.virtual_memory().percent)
-        uptime.set(time.time() - psutil.boot_time())
-
-        disk_root = shutil.disk_usage("/")
-        disk_root_free.set(disk_root.free)
-
-        try:
-            qbit_res = requests.get(f"{QBIT_URL}/api/v2/auth/login", auth=(QBIT_USER, QBIT_PASS), timeout=5)
-            if qbit_res.ok:
-                downloads_mount = "/mnt/local/downloads"
-                if os.path.exists(downloads_mount):
-                    downloads_stat = shutil.disk_usage(downloads_mount)
-                    disk_downloads_free.set(downloads_stat.free)
-        except Exception as e:
-            print(f"[WARN] Failed to get qBittorrent download path: {e}")
-
-        # ===== CPU info =====
-        cpu_cores.set(psutil.cpu_count(logical=True))
-        cpu_threads.set(psutil.cpu_count(logical=True))
-        cpu_sockets.set(len(psutil.cpu_stats()))
-
-        try:
-            # base clock via /proc/cpuinfo or lscpu
-            lscpu = subprocess.run(["lscpu"], capture_output=True, text=True)
-            for line in lscpu.stdout.splitlines():
-                if "CPU MHz" in line:
-                    mhz = float(line.split(":")[1].strip())
-                    cpu_base_clock.set(round(mhz / 1000, 2))
-                    break
-        except Exception as e:
-            print(f"[WARN] Could not determine base clock: {e}")
-
-        # ===== Top processes =====
-        processes = [(p.info["pid"], p.info["name"], p.info["cpu_percent"], p.info["memory_info"].rss)
-                     for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_info"])]
-
-        top_by_cpu = sorted(processes, key=lambda p: p[2], reverse=True)[:5]
-        top_by_ram = sorted(processes, key=lambda p: p[3], reverse=True)[:5]
-
-        for pid, name, cpu, _ in top_by_cpu:
-            top_cpu_process.labels(pid=str(pid), name=name).set(cpu)
-
-        for pid, name, _, ram in top_by_ram:
-            top_ram_process.labels(pid=str(pid), name=name).set(ram)
-
+        gauges["tautulli_active_streams"].set(len(sessions))
+        gauges["tautulli_bandwidth_total_kbps"].set(sum(int(s.get("wan_bandwidth", 0)) for s in sessions))
+        gauges["tautulli_transcodes_active"].set(sum(1 for s in sessions if s.get("transcode_decision") == "transcode"))
     except Exception as e:
-        print(f"[ERROR] Exporter failed: {e}")
+        print(f"[WARNING] Failed to fetch Tautulli metrics: {e}")
+
+    # ================== System ==================
+    try:
+        gauges["neonboard_cpu_usage_percent"].set(psutil.cpu_percent(interval=1))
+        gauges["neonboard_ram_usage_percent"].set(psutil.virtual_memory().percent)
+        gauges["neonboard_uptime_seconds"].set(time.time() - psutil.boot_time())
+
+        gauges["neonboard_cpu_base_mhz"].set(psutil.cpu_freq().min)
+        gauges["neonboard_cpu_sockets"].set(len(psutil.cpu_stats()))
+        gauges["neonboard_cpu_cores"].set(psutil.cpu_count(logical=False))
+        gauges["neonboard_cpu_threads"].set(psutil.cpu_count(logical=True))
+
+        root_free = shutil.disk_usage("/").free
+        gauges["neonboard_disk_root_bytes_free"].set(root_free)
+
+        downloads_path = get_qbit_download_path()
+        try:
+            downloads_free = shutil.disk_usage(downloads_path).free
+        except Exception:
+            downloads_free = 0
+        gauges["neonboard_disk_downloads_bytes_free"].set(downloads_free)
+
+        # Top 5 CPU and RAM usage processes
+        processes = [(p.info["name"], p.pid, p.info["cpu_percent"], p.info["memory_info"].rss / 1024 / 1024)
+                     for p in psutil.process_iter(["name", "cpu_percent", "memory_info"])]
+
+        for name, pid, cpu, mem in sorted(processes, key=lambda x: x[2], reverse=True)[:5]:
+            top_cpu.labels(name=name, pid=str(pid)).set(cpu)
+        for name, pid, cpu, mem in sorted(processes, key=lambda x: x[3], reverse=True)[:5]:
+            top_ram.labels(name=name, pid=str(pid)).set(mem)
+    except Exception as e:
+        print(f"[ERROR] System metrics failed: {e}")
 
     return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
 
