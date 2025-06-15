@@ -153,7 +153,7 @@ def metrics():
         gauges["neonboard_cpu_usage_percent"].set(psutil.cpu_percent(interval=1))
         gauges["neonboard_ram_usage_percent"].set(psutil.virtual_memory().percent)
         gauges["neonboard_uptime_seconds"].set(time.time() - psutil.boot_time())
-        gauges["neonboard_cpu_base_mhz"].set(psutil.cpu_freq().min)
+        gauges["neonboard_cpu_base_mhz"].set(psutil.cpu_freq().max)
         gauges["neonboard_cpu_sockets"].set(get_cpu_sockets())
         gauges["neonboard_cpu_cores"].set(psutil.cpu_count(logical=False))
         gauges["neonboard_cpu_threads"].set(psutil.cpu_count(logical=True))
