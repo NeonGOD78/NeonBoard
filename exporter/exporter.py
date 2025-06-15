@@ -1,4 +1,3 @@
-
 from flask import Flask, Response
 from prometheus_client import Gauge, generate_latest, CONTENT_TYPE_LATEST
 import psutil
@@ -38,30 +37,39 @@ gauges = {
 top_cpu = Gauge("neonboard_top_cpu_process_percent", "Top process CPU usage", ["name", "pid"])
 top_ram = Gauge("neonboard_top_ram_process_mb", "Top process RAM usage in MB", ["name", "pid"])
 
-def get_qbit_download_path():
+def get_qbit_download_mount_path():
     try:
         session = requests.Session()
-        login = session.post(f"{QBIT_URL}/api/v2/auth/login", data={
+        session.post(f"{QBIT_URL}/api/v2/auth/login", data={
             "username": QBIT_USER,
             "password": QBIT_PASS
         }, timeout=5)
 
-        if login.status_code != 200 or "ok" not in login.text:
-            raise Exception("Login failed")
+        r = session.get(f"{QBIT_URL}/api/v2/app/preferences", timeout=5)
+        data = r.json()
+        save_path = data.get("save_path", "")
 
-        pref = session.get(f"{QBIT_URL}/api/v2/app/preferences", timeout=5)
-        if pref.status_code != 200:
-            raise Exception("Could not fetch preferences")
+        # Mulige bind mounts i containeren
+        possible_mounts = [
+            "/mnt/local/downloads",
+            "/downloads",
+            "/mnt/qbit-downloads",
+        ]
 
-        data = pref.json()
-        return data.get("save_path", "/mnt/local/downloads")
+        for mount in possible_mounts:
+            if save_path.startswith(mount):
+                return mount
+
+        print(f"[WARNING] No matching bind-mount found for save_path: {save_path}")
+        return None
+
     except Exception as e:
         print(f"[WARNING] Failed to get qBittorrent download path: {e}")
-        return "/mnt/local/downloads"
+        return None
 
 @app.route("/metrics")
 def metrics():
-    # Tautulli
+    # ================== Tautulli ==================
     try:
         r = requests.get(f"{TAUTULLI_URL}/api/v2?apikey={TAUTULLI_API_KEY}&cmd=get_activity", timeout=5)
         data = r.json()
@@ -73,13 +81,15 @@ def metrics():
     except Exception as e:
         print(f"[WARNING] Failed to fetch Tautulli metrics: {e}")
 
-    # System
+    # ================== System ==================
     try:
         gauges["neonboard_cpu_usage_percent"].set(psutil.cpu_percent(interval=1))
         gauges["neonboard_ram_usage_percent"].set(psutil.virtual_memory().percent)
         gauges["neonboard_uptime_seconds"].set(time.time() - psutil.boot_time())
 
-        gauges["neonboard_cpu_base_mhz"].set(psutil.cpu_freq().min)
+        freq = psutil.cpu_freq()
+        if freq:
+            gauges["neonboard_cpu_base_mhz"].set(freq.min)
         gauges["neonboard_cpu_sockets"].set(len(psutil.cpu_stats()))
         gauges["neonboard_cpu_cores"].set(psutil.cpu_count(logical=False))
         gauges["neonboard_cpu_threads"].set(psutil.cpu_count(logical=True))
@@ -87,14 +97,17 @@ def metrics():
         root_free = shutil.disk_usage("/").free
         gauges["neonboard_disk_root_bytes_free"].set(root_free)
 
-        downloads_path = get_qbit_download_path()
-        try:
-            downloads_free = shutil.disk_usage(downloads_path).free
-        except Exception:
+        downloads_mount = get_qbit_download_mount_path()
+        if downloads_mount and os.path.exists(downloads_mount):
+            try:
+                downloads_free = shutil.disk_usage(downloads_mount).free
+            except Exception:
+                downloads_free = 0
+        else:
             downloads_free = 0
         gauges["neonboard_disk_downloads_bytes_free"].set(downloads_free)
 
-        # Top 5 CPU and RAM usage processes
+        # Top 5 CPU og RAM processer
         processes = [(p.info["name"], p.pid, p.info["cpu_percent"], p.info["memory_info"].rss / 1024 / 1024)
                      for p in psutil.process_iter(["name", "cpu_percent", "memory_info"])]
 
@@ -102,6 +115,7 @@ def metrics():
             top_cpu.labels(name=name, pid=str(pid)).set(cpu)
         for name, pid, cpu, mem in sorted(processes, key=lambda x: x[3], reverse=True)[:5]:
             top_ram.labels(name=name, pid=str(pid)).set(mem)
+
     except Exception as e:
         print(f"[ERROR] System metrics failed: {e}")
 
