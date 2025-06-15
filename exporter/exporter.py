@@ -6,7 +6,6 @@ import platform
 import time
 import os
 import requests
-import json
 
 app = Flask(__name__)
 
@@ -20,52 +19,47 @@ QBIT_PASS = os.getenv("QBIT_PASS")
 
 # Prometheus metrics
 gauges = {
+    # Tautulli
     "tautulli_active_streams": Gauge("tautulli_active_streams", "Number of active streams"),
     "tautulli_bandwidth_total_kbps": Gauge("tautulli_bandwidth_total_kbps", "Total bandwidth usage in kbps"),
     "tautulli_transcodes_active": Gauge("tautulli_transcodes_active", "Number of active transcodes"),
+
+    # System
     "neonboard_cpu_usage_percent": Gauge("neonboard_cpu_usage_percent", "Current CPU usage in percent"),
     "neonboard_ram_usage_percent": Gauge("neonboard_ram_usage_percent", "Current RAM usage in percent"),
-    "neonboard_disk_root_bytes_free": Gauge("neonboard_disk_root_bytes_free", "Free disk space on / in bytes"),
-    "neonboard_disk_downloads_bytes_free": Gauge("neonboard_disk_downloads_bytes_free", "Free disk space on downloads mount in bytes"),
     "neonboard_uptime_seconds": Gauge("neonboard_uptime_seconds", "System uptime in seconds"),
     "neonboard_cpu_base_mhz": Gauge("neonboard_cpu_base_mhz", "CPU base clock speed in MHz"),
     "neonboard_cpu_sockets": Gauge("neonboard_cpu_sockets", "Number of physical CPU sockets"),
     "neonboard_cpu_cores": Gauge("neonboard_cpu_cores", "Number of physical CPU cores"),
     "neonboard_cpu_threads": Gauge("neonboard_cpu_threads", "Number of logical CPU threads"),
+
+    # Disk (root)
+    "neonboard_disk_root_bytes_free": Gauge("neonboard_disk_root_bytes_free", "Free disk space on / in bytes"),
+    "neonboard_disk_root_bytes_total": Gauge("neonboard_disk_root_bytes_total", "Total disk space on / in bytes"),
+    "neonboard_disk_root_bytes_used": Gauge("neonboard_disk_root_bytes_used", "Used disk space on / in bytes"),
+
+    # Disk (downloads)
+    "neonboard_disk_downloads_bytes_free": Gauge("neonboard_disk_downloads_bytes_free", "Free disk space on downloads mount in bytes"),
+    "neonboard_disk_downloads_bytes_total": Gauge("neonboard_disk_downloads_bytes_total", "Total disk space on downloads mount in bytes"),
+    "neonboard_disk_downloads_bytes_used": Gauge("neonboard_disk_downloads_bytes_used", "Used disk space on downloads mount in bytes"),
 }
 
 top_cpu = Gauge("neonboard_top_cpu_process_percent", "Top process CPU usage", ["name", "pid"])
 top_ram = Gauge("neonboard_top_ram_process_mb", "Top process RAM usage in MB", ["name", "pid"])
 
-def get_qbit_download_mount_path():
+def get_qbit_download_path():
     try:
         session = requests.Session()
         session.post(f"{QBIT_URL}/api/v2/auth/login", data={
             "username": QBIT_USER,
             "password": QBIT_PASS
         }, timeout=5)
-
         r = session.get(f"{QBIT_URL}/api/v2/app/preferences", timeout=5)
         data = r.json()
-        save_path = data.get("save_path", "")
-
-        # Mulige bind mounts i containeren
-        possible_mounts = [
-            "/mnt/local/downloads",
-            "/downloads",
-            "/mnt/qbit-downloads",
-        ]
-
-        for mount in possible_mounts:
-            if save_path.startswith(mount):
-                return mount
-
-        print(f"[WARNING] No matching bind-mount found for save_path: {save_path}")
-        return None
-
+        return data.get("save_path", "/mnt/local/downloads")
     except Exception as e:
         print(f"[WARNING] Failed to get qBittorrent download path: {e}")
-        return None
+        return "/mnt/local/downloads"
 
 @app.route("/metrics")
 def metrics():
@@ -87,27 +81,29 @@ def metrics():
         gauges["neonboard_ram_usage_percent"].set(psutil.virtual_memory().percent)
         gauges["neonboard_uptime_seconds"].set(time.time() - psutil.boot_time())
 
-        freq = psutil.cpu_freq()
-        if freq:
-            gauges["neonboard_cpu_base_mhz"].set(freq.min)
+        gauges["neonboard_cpu_base_mhz"].set(psutil.cpu_freq().min)
         gauges["neonboard_cpu_sockets"].set(len(psutil.cpu_stats()))
         gauges["neonboard_cpu_cores"].set(psutil.cpu_count(logical=False))
         gauges["neonboard_cpu_threads"].set(psutil.cpu_count(logical=True))
 
-        root_free = shutil.disk_usage("/").free
-        gauges["neonboard_disk_root_bytes_free"].set(root_free)
+        # Root disk
+        root_usage = shutil.disk_usage("/")
+        gauges["neonboard_disk_root_bytes_free"].set(root_usage.free)
+        gauges["neonboard_disk_root_bytes_total"].set(root_usage.total)
+        gauges["neonboard_disk_root_bytes_used"].set(root_usage.used)
 
-        downloads_mount = get_qbit_download_mount_path()
-        if downloads_mount and os.path.exists(downloads_mount):
-            try:
-                downloads_free = shutil.disk_usage(downloads_mount).free
-            except Exception:
-                downloads_free = 0
-        else:
-            downloads_free = 0
-        gauges["neonboard_disk_downloads_bytes_free"].set(downloads_free)
+        # Downloads disk
+        downloads_path = get_qbit_download_path()
+        try:
+            downloads_usage = shutil.disk_usage(downloads_path)
+        except Exception:
+            downloads_usage = shutil._ntuple_diskusage(total=0, used=0, free=0)
 
-        # Top 5 CPU og RAM processer
+        gauges["neonboard_disk_downloads_bytes_free"].set(downloads_usage.free)
+        gauges["neonboard_disk_downloads_bytes_total"].set(downloads_usage.total)
+        gauges["neonboard_disk_downloads_bytes_used"].set(downloads_usage.used)
+
+        # Top 5 CPU and RAM usage processes
         processes = [(p.info["name"], p.pid, p.info["cpu_percent"], p.info["memory_info"].rss / 1024 / 1024)
                      for p in psutil.process_iter(["name", "cpu_percent", "memory_info"])]
 
@@ -115,7 +111,6 @@ def metrics():
             top_cpu.labels(name=name, pid=str(pid)).set(cpu)
         for name, pid, cpu, mem in sorted(processes, key=lambda x: x[3], reverse=True)[:5]:
             top_ram.labels(name=name, pid=str(pid)).set(mem)
-
     except Exception as e:
         print(f"[ERROR] System metrics failed: {e}")
 
